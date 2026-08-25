@@ -31,35 +31,21 @@ type AttendanceRecord struct {
 	UpdatedAt   string   `json:"updatedAt,omitempty"`
 }
 
-type LeaveTransactionsResponse struct {
-	Data  []EmployeeLeaveData `json:"data"`
-	Pages PageInfo            `json:"pages"`
-}
-
 type EmployeeLeaveData struct {
 	EmployeeID int                `json:"employeeId"`
 	List       []LeaveTransaction `json:"list"`
 }
 
-type PageInfo struct {
-	TotalPages    int  `json:"totalPages"`
-	TotalElements int  `json:"totalElements"`
-	HasNext       bool `json:"hasNext"`
-	Size          int  `json:"size"`
-}
-
 type LeaveTransaction struct {
-	ID                   int     `json:"id"`
-	LeaveTypeCategory    int     `json:"leaveTypeCategory"`
-	LeaveTransactionType int     `json:"leaveTransactionType"`
-	FromDate             string  `json:"fromDate"`
-	ToDate               string  `json:"toDate"`
-	Days                 float64 `json:"days"`
-	FromSession          int     `json:"fromSession"`
-	ToSession            int     `json:"toSession"`
-	Remarks              string  `json:"remarks"`
-	Cancelled            bool    `json:"cancelled"`
-	Reason               string  `json:"reason"`
+	ID          int     `json:"id"`
+	FromDate    string  `json:"fromDate"`
+	ToDate      string  `json:"toDate"`
+	Days        float64 `json:"days"`
+	FromSession string  `json:"fromSession"`
+	ToSession   string  `json:"toSession"`
+	Remarks     string  `json:"remarks"`
+	Cancelled   bool    `json:"cancelled"`
+	Reason      string  `json:"reason"`
 }
 
 type AbsenteeReport struct {
@@ -101,19 +87,27 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 
 	log.Info("Active Employees: %d", len(activeEmpCodes))
 
-	minDate, maxDate := dateRange(records)
-	log.Info("date range: %s to %s", minDate, maxDate)
-
-	leaveData, err := fetchAllLeaveTransactions(token, config, minDate, maxDate, log)
-	if err != nil {
-		return "", fmt.Errorf("fetch leave transactions: %w", err)
+	now := time.Now()
+	startYear := now.Year()
+	if now.Month() == time.January {
+		startYear--
 	}
-	log.Info("fetched leave data for %d employees", len(leaveData))
+	leaveStart := time.Date(startYear, 1, 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
+	leaveEnd := now.Format("2006-01-02")
+	log.Info("fetching leaves from %s to %s for %d employees", leaveStart, leaveEnd, len(empCodeToID))
 
 	empLeaves := map[int][]LeaveTransaction{}
-	for _, eld := range leaveData {
-		empLeaves[eld.EmployeeID] = eld.List
+	for code, empID := range empCodeToID {
+		leaves, err := fetchEmployeeLeaveTransactions(token, config, empID, leaveStart, leaveEnd)
+		if err != nil {
+			log.Error("failed to fetch leaves for %s (id=%d): %v", code, empID, err)
+			continue
+		}
+		if len(leaves) > 0 {
+			empLeaves[empID] = leaves
+		}
 	}
+	log.Info("fetched leave data for %d employees", len(empLeaves))
 
 	var report []AbsenteeReport
 	for _, rec := range records {
@@ -187,51 +181,18 @@ func padEmpCode(code string, width int) string {
 	return code
 }
 
-func dateRange(records []AttendanceRecord) (string, string) {
-	min, max := records[0].Date, records[0].Date
-	for _, r := range records[1:] {
-		if r.Date < min {
-			min = r.Date
-		}
-		if r.Date > max {
-			max = r.Date
-		}
-	}
-	return min, max
-}
-
-func fetchAllLeaveTransactions(token string, config map[string]string, startDate, endDate string, log *log.Logger) ([]EmployeeLeaveData, error) {
-	var all []EmployeeLeaveData
-	page := 0
-
-	for {
-		data, pages, err := fetchLeaveTransactionsPage(token, config, startDate, endDate, page)
-		if err != nil {
-			return nil, err
-		}
-		all = append(all, data...)
-		// log.Info("leave transactions page %d: %d employee records", page, len(data))
-
-		if !pages.HasNext {
-			break
-		}
-		page++
-	}
-	return all, nil
-}
-
-func fetchLeaveTransactionsPage(token string, config map[string]string, startDate, endDate string, page int) ([]EmployeeLeaveData, PageInfo, error) {
-	url := fmt.Sprintf("%s/leave/v2/employee/transactions?start=%s&end=%s&page=%d", config["baseURL"], startDate, endDate, page)
+func fetchEmployeeLeaveTransactions(token string, config map[string]string, empID int, startDate, endDate string) ([]LeaveTransaction, error) {
+	url := fmt.Sprintf("%s/leave/v2/employee/%d/transactions?start=%s&end=%s", config["baseURL"], empID, startDate, endDate)
 	body, err := greythrGet(url, token, config["x_greythr_domain"])
 	if err != nil {
-		return nil, PageInfo{}, fmt.Errorf("leave transactions page %d: %w", page, err)
+		return nil, fmt.Errorf("fetch leave for employee %d: %w", empID, err)
 	}
 
-	var resp LeaveTransactionsResponse
+	var resp EmployeeLeaveData
 	if err := json.Unmarshal(body, &resp); err != nil {
-		return nil, PageInfo{}, fmt.Errorf("unmarshal leave transactions page %d: %w", page, err)
+		return nil, fmt.Errorf("unmarshal leave for employee %d: %w", empID, err)
 	}
-	return resp.Data, resp.Pages, nil
+	return resp.List, nil
 }
 
 func greythrGet(url, token, domain string) ([]byte, error) {
