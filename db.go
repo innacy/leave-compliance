@@ -43,7 +43,7 @@ func FetchAttendance(cfg *Config) ([]AttendanceRow, error) {
 		FROM AttendanceLogs a INNER JOIN Employees e ON a.EmployeeId = e.EmployeeId
 		WHERE a.AttendanceDate >= @startDate
 		  AND a.AttendanceDate < @todayDate
-		  AND a.Status IN ('Present')
+		  AND a.Status IN ('Present', '1/2Present', '1/2 Present')
 		ORDER BY CAST(a.AttendanceDate AS DATE), e.EmployeeCode
 	`
 

@@ -3,7 +3,6 @@ package handler
 import (
 	"context"
 	"encoding/json"
-	"strconv"
 	"time"
 
 	"github.com/innacy/table"
@@ -24,14 +23,8 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 	tableId := config["tableId"]
 	ctx := context.Background()
 
-	daysToFetch, err := strconv.Atoi(config["days_to_fetch"])
-	if err != nil {
-		log.Error("invalid days_to_fetch value: %v", err)
-		return "", err
-	}
-
 	today := time.Now().UTC()
-	weekdays := getLastWeekWeekdays(today, daysToFetch)
+	weekdays := getPreviousWeekWorkdays(today)
 
 	log.Info("fetching attendance for %d weekdays", len(weekdays))
 
@@ -89,4 +82,16 @@ func getLastWeekWeekdays(today time.Time, daysToFetch int) []time.Time {
 	}
 
 	return weekdays
+}
+
+func getPreviousWeekWorkdays(today time.Time) []time.Time {
+	offset := (int(today.Weekday()) - int(time.Monday) + 7) % 7
+	currentMonday := today.AddDate(0, 0, -offset)
+	prevMonday := currentMonday.AddDate(0, 0, -7)
+
+	days := make([]time.Time, 5)
+	for i := 0; i < 5; i++ {
+		days[i] = prevMonday.AddDate(0, 0, i)
+	}
+	return days
 }
