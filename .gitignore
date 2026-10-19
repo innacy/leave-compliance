@@ -1,5 +1,4 @@
 .superpowers/
-attendance-sync
-attendance-sync.exe
-attendance.exe
+*.exe
 .env
+*.txt

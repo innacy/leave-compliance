@@ -17,7 +17,7 @@ type AttendanceRecord struct {
 }
 
 func Execute(event string, config map[string]string, vars map[string]string, log *log.Logger) (string, error) {
-	log.Info("inside attendance get handler")
+	// log.Info("inside attendance get handler")
 
 	tableAccessor := table.NewCnipsTableAccessor[AttendanceRecord](config["table_base_url"], config["apiKey"])
 	tableId := config["tableId"]
@@ -26,7 +26,7 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 	today := time.Now().UTC()
 	weekdays := getPreviousWeekWorkdays(today)
 
-	log.Info("fetching attendance for %d weekdays", len(weekdays))
+	log.Info("Fetching attendance for %d weekdays [%s to %s]", len(weekdays), weekdays[0].Format("2006-01-02"), weekdays[4].Format("2006-01-02"))
 
 	var results []AttendanceRecord
 
@@ -45,13 +45,13 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 
 		if len(rows) > 0 {
 			results = append(results, rows[0])
-			log.Info("found record for %s with %d present", dateStr, len(rows[0].PresentList))
+			log.Info("Date %s -> %d present", dateStr, len(rows[0].PresentList))
 		} else {
-			log.Info("no record found for %s", dateStr)
+			log.Info("Date %s -> No records", dateStr)
 		}
 	}
 
-	log.Info("total records fetched: %d", len(results))
+	// log.Info("total records fetched: %d", len(results))
 
 	var outputEvent map[string]interface{}
 	if err := json.Unmarshal([]byte(event), &outputEvent); err != nil {

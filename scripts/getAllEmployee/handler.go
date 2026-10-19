@@ -40,7 +40,7 @@ type EmpData struct {
 }
 
 func Execute(event string, config map[string]string, vars map[string]string, log *log.Logger) (string, error) {
-	log.Info("inside get all employees handler")
+	// log.Info("inside get all employees handler")
 
 	token := vars["greythrToken"]
 
@@ -48,7 +48,7 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 	if err != nil {
 		return "", fmt.Errorf("fetch employees: %w", err)
 	}
-	log.Info("fetched %d employees from GreytHR", len(allEmployees))
+	// log.Info("fetched %d employees from GreytHR", len(allEmployees))
 
 	empCodeToName := map[string]string{}
 	empCodeToEmail := map[string]string{}
@@ -70,7 +70,7 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 		empIDToCode[emp.EmployeeID] = code
 		activeEmpCodes[code] = true
 	}
-	log.Info("active employees: %d", len(activeEmpCodes))
+	log.Info("Total active employees: %d", len(activeEmpCodes))
 
 	outputEvent := map[string]interface{}{
 		"employees": EmpData{
@@ -101,7 +101,7 @@ func fetchAllEmployees(token string, config map[string]string, log *log.Logger) 
 			return nil, err
 		}
 		all = append(all, employees...)
-		log.Info("employees page %d: %d records", page, len(employees))
+		// log.Info("employees page %d: %d records", page, len(employees))
 
 		if !pages.HasNext {
 			break

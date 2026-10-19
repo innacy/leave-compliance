@@ -107,7 +107,34 @@ type Recipient struct {
 }
 
 func Execute(event string, config map[string]string, vars map[string]string, log *log.Logger) (string, error) {
-	log.Info("inside send mail handler")
+	// log.Info("inside send mail handler")
+
+	var reports []AbsenteeReport
+	if err := json.Unmarshal([]byte(event), &reports); err != nil {
+		return "", fmt.Errorf("unmarshal absentee reports: %w", err)
+	}
+
+	unapplied := collectUnappliedAbsentees(reports)
+	log.Info("Found %d employees with unapplied leaves", len(unapplied))
+
+	// Early exit if mail sending is disabled
+	if strings.ToLower(config["sendMail"]) == "false" {
+		log.Info("sendMail is disabled, skipping mail dispatch")
+
+		if len(unapplied) == 0 {
+			log.Info("No employees found with unapplied leaves")
+		} else {
+			for email, info := range unapplied {
+				log.Info(
+					"Employee: %s (%s), Dates: %s",
+					info.name,
+					email,
+					strings.Join(info.dates, ", "),
+				)
+			}
+		}
+		return `{"sent":0,"failed":0,"total":0,"details":[],"skipped":"sendMail disabled"}`, nil
+	}
 
 	accessToken := vars["microsoftToken"]
 	senderEmail := config["senderEmail"]
@@ -127,14 +154,6 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 			}
 		}
 	}
-
-	var reports []AbsenteeReport
-	if err := json.Unmarshal([]byte(event), &reports); err != nil {
-		return "", fmt.Errorf("unmarshal absentee reports: %w", err)
-	}
-
-	unapplied := collectUnappliedAbsentees(reports)
-	log.Info("found %d employees with unapplied leaves", len(unapplied))
 
 	type mailResult struct {
 		EmpName string   `json:"empName"`
@@ -163,7 +182,7 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 			failed++
 			continue
 		}
-		log.Info("sent reminder to %s (%s) for dates: %s", info.name, email, strings.Join(info.dates, ", "))
+		log.Info("Sent reminder to %s (%s) for dates: %s", info.name, email, strings.Join(info.dates, ", "))
 		results = append(results, mailResult{
 			EmpName: info.name,
 			Email:   email,

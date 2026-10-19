@@ -58,6 +58,10 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 		}
 
 		if len(existing) > 0 {
+			if len(existing) == 1 && existing[0].Date == dayData.Date && len(existing[0].PresentList) > len(dayData.Present) {
+				log.Info("skipping update for date %s: existing record has more present employees (%d) than new data (%d)", dayData.Date, len(existing[0].PresentList), len(dayData.Present))
+				continue
+			}
 			updateData := &AttendanceRow{
 				PresentList:     dayData.Present,
 				PresentEmpNames: dayData.PresentEmpNames,

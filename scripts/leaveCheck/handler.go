@@ -2,10 +2,12 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/zinscky/log"
@@ -62,7 +64,7 @@ type AbsenteeDetail struct {
 }
 
 func Execute(event string, config map[string]string, vars map[string]string, log *log.Logger) (string, error) {
-	log.Info("inside leave check handler")
+	// log.Info("inside leave check handler")
 
 	var inputEvent InputEvent
 	if err := json.Unmarshal([]byte(event), &inputEvent); err != nil {
@@ -75,8 +77,7 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 		return "[]", nil
 	}
 
-	// token := vars["greythrToken"]
-	token := "ory_at_FydDDLZvE_Ff92uNLlmC9bjd99sR1d5v-mkRs3Arjuw.r1SgEnK6s9jAHqhhBBURVB-_VZXZzYbpTKNTEl0w9zs"
+	token := vars["greythrToken"]
 	excludeSet := csvToSet(vars["EXCLUDE_EMP_CODES"])
 	wfhSet := csvToSet(vars["WFH_EMP_CODES"])
 
@@ -85,44 +86,106 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 	empCodeToID := inputEvent.Employees.EmpCodeToID
 	activeEmpCodes := inputEvent.Employees.ActiveEmpCodes
 
-	log.Info("Active Employees: %d", len(activeEmpCodes))
-
 	now := time.Now()
-	startYear := now.Year()
-	if now.Month() == time.January {
-		startYear--
-	}
-	leaveStart := time.Date(startYear, 1, 1, 0, 0, 0, 0, now.Location()).Format("2006-01-02")
-	leaveEnd := now.Format("2006-01-02")
-	log.Info("fetching leaves from %s to %s for %d employees", leaveStart, leaveEnd, len(empCodeToID))
 
-	empLeaves := map[int][]LeaveTransaction{}
-	for code, empID := range empCodeToID {
-		leaves, err := fetchEmployeeLeaveTransactions(token, config, empID, leaveStart, leaveEnd)
-		if err != nil {
-			log.Error("failed to fetch leaves for %s (id=%d): %v", code, empID, err)
-			continue
-		}
-		if len(leaves) > 0 {
-			empLeaves[empID] = leaves
-		}
+	// Step 1: Build absent set across all dates FIRST (before any API calls).
+	// This determines which employees we actually need to fetch leaves for.
+	type absentEntry struct {
+		code  string
+		empID int
+		dates []string
 	}
-	log.Info("fetched leave data for %d employees", len(empLeaves))
+	absentByCode := map[string]*absentEntry{}
+	dateAbsentCodes := map[string][]string{} // date -> list of absent codes
 
-	var report []AbsenteeReport
 	for _, rec := range records {
 		presentSet := sliceToSet(rec.PresentList)
-
 		if len(presentSet) < 5 {
-			log.Info("skipping date %s: only %d present (likely a holiday)", rec.Date, len(presentSet))
+			log.Info("Skipping date %s: only %d present (likely a holiday)", rec.Date, len(presentSet))
 			continue
 		}
-		// log.Info("Present Employees on date %s: %v", rec.Date, presentSet)
+
+		var absentCodes []string
+		for code := range activeEmpCodes {
+			if presentSet[code] || excludeSet[code] || wfhSet[code] {
+				continue
+			}
+			empID, hasID := empCodeToID[code]
+			if !hasID {
+				continue
+			}
+
+			if entry, ok := absentByCode[code]; ok {
+				entry.dates = append(entry.dates, rec.Date)
+			} else {
+				absentByCode[code] = &absentEntry{code: code, empID: empID, dates: []string{rec.Date}}
+			}
+			absentCodes = append(absentCodes, code)
+		}
+		dateAbsentCodes[rec.Date] = absentCodes
+	}
+
+	log.Info("Found %d unique absent employees across %d dates", len(absentByCode), len(dateAbsentCodes))
+
+	if len(absentByCode) == 0 {
+		log.Info("No absentees to check")
+		return "[]", nil
+	}
+
+	// Step 2: Fetch leaves ONLY for absent employees (month-1 window).
+	leaveStart := now.AddDate(0, -1, 0).Format("2006-01-02")
+	leaveEnd := now.Format("2006-01-02")
+	log.Info("Fetching greytHR leave transactions from %s to %s for %d absent employees", leaveStart, leaveEnd, len(absentByCode))
+
+	type fetchResult struct {
+		code   string
+		empID  int
+		leaves []LeaveTransaction
+		err    error
+	}
+
+	results := make(chan fetchResult, len(absentByCode))
+	sem := make(chan struct{}, leaveFetchConcurrency)
+	var wg sync.WaitGroup
+	for _, entry := range absentByCode {
+		wg.Add(1)
+		go func(code string, empID int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			leaves, err := fetchEmployeeLeaveTransactions(token, config, empID, leaveStart, leaveEnd, log)
+			results <- fetchResult{code: code, empID: empID, leaves: leaves, err: err}
+		}(entry.code, entry.empID)
+	}
+	go func() { wg.Wait(); close(results) }()
+
+	empLeaves := map[int][]LeaveTransaction{}
+	failedFetch := map[string]bool{}
+	for r := range results {
+		if r.err != nil {
+			log.Error("failed to fetch leaves for %s (id=%d), employee will be skipped: %v", r.code, r.empID, r.err)
+			failedFetch[r.code] = true
+			continue
+		}
+		if len(r.leaves) > 0 {
+			empLeaves[r.empID] = r.leaves
+		}
+	}
+	log.Info("Fetched leave data for %d employees, %d failed", len(empLeaves), len(failedFetch))
+
+	// Step 3: Build the absentee report.
+	var report []AbsenteeReport
+	for _, rec := range records {
+		absentCodes, ok := dateAbsentCodes[rec.Date]
+		if !ok {
+			continue // date was skipped (holiday)
+		}
 
 		var absentees []AbsenteeDetail
 		var absenteeNames []string
-		for code := range activeEmpCodes {
-			if presentSet[code] || excludeSet[code] || wfhSet[code] {
+		for _, code := range absentCodes {
+			if failedFetch[code] {
+				log.Warn("date %s: skipping %s, leave data unavailable", rec.Date, code)
 				continue
 			}
 
@@ -143,8 +206,73 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 			Date:      rec.Date,
 			Absentees: absentees,
 		})
-		log.Info("date %s: %d absentees", rec.Date, len(absentees))
-		log.Info("date %s: absentees %v", rec.Date, absenteeNames)
+		log.Info("Date %s: %d Absentees [%s]", rec.Date, len(absentees), strings.Join(absenteeNames, ", "))
+	}
+
+	// Validation pass: for employees marked absent without leave, check
+	// deeper windows (month-2 then month-3, each ≤30 days) before sending
+	// mail. If a deeper fetch errors, the employee is removed entirely.
+	deeperWindows := []struct{ start, end string }{
+		{now.AddDate(0, -2, 0).Format("2006-01-02"), now.AddDate(0, -1, 0).Format("2006-01-02")},
+		{now.AddDate(0, -3, 0).Format("2006-01-02"), now.AddDate(0, -2, 0).Format("2006-01-02")},
+	}
+
+	needsCheck := map[string]bool{}
+	for _, rep := range report {
+		for _, a := range rep.Absentees {
+			if !a.LeaveApplied {
+				needsCheck[a.EmpCode] = true
+			}
+		}
+	}
+
+	for _, w := range deeperWindows {
+		if len(needsCheck) == 0 {
+			break
+		}
+		log.Info("Deeper check window %s to %s for %d employees", w.start, w.end, len(needsCheck))
+
+		stillNeeds := map[string]bool{}
+		for code := range needsCheck {
+			empID := empCodeToID[code]
+			leaves, err := fetchEmployeeLeaveTransactions(token, config, empID, w.start, w.end, log)
+			if err != nil {
+				log.Error("deeper check failed for %s (id=%d), will be skipped: %v", code, empID, err)
+				failedFetch[code] = true
+				continue
+			}
+
+			found := false
+			for i := range report {
+				for j := range report[i].Absentees {
+					a := &report[i].Absentees[j]
+					if a.EmpCode != code || a.LeaveApplied {
+						continue
+					}
+					matching := leavesOnDate(leaves, report[i].Date)
+					if len(matching) > 0 {
+						a.LeaveApplied = true
+						a.Leaves = matching
+						found = true
+					}
+				}
+			}
+			if !found {
+				stillNeeds[code] = true
+			}
+		}
+		needsCheck = stillNeeds
+	}
+
+	// Remove employees whose deeper check failed from the report entirely.
+	for i := range report {
+		var kept []AbsenteeDetail
+		for _, a := range report[i].Absentees {
+			if !failedFetch[a.EmpCode] {
+				kept = append(kept, a)
+			}
+		}
+		report[i].Absentees = kept
 	}
 
 	output, err := json.Marshal(report)
@@ -181,9 +309,26 @@ func padEmpCode(code string, width int) string {
 	return code
 }
 
-func fetchEmployeeLeaveTransactions(token string, config map[string]string, empID int, startDate, endDate string) ([]LeaveTransaction, error) {
+var (
+	leaveFetchMaxAttempts = 5
+	leaveFetchBaseBackoff = 2 * time.Second
+	leaveFetchConcurrency = 5
+)
+
+func fetchEmployeeLeaveTransactions(token string, config map[string]string, empID int, startDate, endDate string, log *log.Logger) ([]LeaveTransaction, error) {
 	url := fmt.Sprintf("%s/leave/v2/employee/%d/transactions?start=%s&end=%s", config["baseURL"], empID, startDate, endDate)
-	body, err := greythrGet(url, token, config["x_greythr_domain"])
+
+	var body []byte
+	var err error
+	for attempt := 1; attempt <= leaveFetchMaxAttempts; attempt++ {
+		body, err = greythrGet(url, token, config["x_greythr_domain"])
+		if err == nil || !isRetryable(err) || attempt == leaveFetchMaxAttempts {
+			break
+		}
+		backoff := leaveFetchBaseBackoff * time.Duration(1<<(attempt-1))
+		log.Warn("fetch leave for employee %d failed (attempt %d/%d), retrying in %s: %v", empID, attempt, leaveFetchMaxAttempts, backoff, err)
+		time.Sleep(backoff)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("fetch leave for employee %d: %w", empID, err)
 	}
@@ -215,9 +360,27 @@ func greythrGet(url, token, domain string) ([]byte, error) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, string(body))
+		return nil, &httpStatusError{StatusCode: resp.StatusCode, Body: string(body)}
 	}
 	return body, nil
+}
+
+type httpStatusError struct {
+	StatusCode int
+	Body       string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("status %d: %s", e.StatusCode, e.Body)
+}
+
+// Network errors and client timeouts are retryable; of HTTP statuses only 429 and 5xx are.
+func isRetryable(err error) bool {
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) {
+		return statusErr.StatusCode == http.StatusTooManyRequests || statusErr.StatusCode >= 500
+	}
+	return true
 }
 
 func leavesOnDate(transactions []LeaveTransaction, date string) []LeaveTransaction {
