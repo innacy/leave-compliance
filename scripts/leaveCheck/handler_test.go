@@ -575,3 +575,102 @@ func TestMultipleDates_DeeperCheckFindsRemaining(t *testing.T) {
 		t.Error("dateB: expected leaveApplied=true via deeper check")
 	}
 }
+
+// ---------- WFH_EMP_DAYS + mid-week holiday swap ----------
+
+// Week of Mon 2026-10-12 .. Fri 2026-10-16 with Wed 2026-10-14 as holiday.
+// emp 00001 is present Mon & Fri, absent Tue & Thu.
+func runHolidayWeek(t *testing.T, leaves []LeaveTransaction) []AbsenteeReport {
+	t.Helper()
+	fake := &fakeGreytHR{respond: func(empID, n int, start, end string) (int, *EmployeeLeaveData) {
+		if empID == 1 && n == 1 {
+			return 0, &EmployeeLeaveData{EmployeeID: 1, List: leaves}
+		}
+		return emptyLeave(empID)
+	}}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+
+	withEmp := append([]string{"00001"}, presentCodes...)
+	records := []AttendanceRecord{
+		{Date: "2026-10-12", PresentList: withEmp},
+		{Date: "2026-10-13", PresentList: presentCodes},
+		{Date: "2026-10-14", PresentList: nil}, // holiday
+		{Date: "2026-10-15", PresentList: presentCodes},
+		{Date: "2026-10-16", PresentList: withEmp},
+	}
+	event := buildEvent(t, records, empData(testEmp{"00001", 1, "Alice", "a@t.com"}))
+	vars := map[string]string{"WFH_EMP_DAYS": `{"00001":"Tuesday"}`}
+	out, err := Execute(event, map[string]string{"baseURL": srv.URL}, vars, log.New(0, "test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parseReport(t, out)
+}
+
+func assertNoMail(t *testing.T, report []AbsenteeReport, code string) {
+	t.Helper()
+	for _, r := range report {
+		for _, a := range r.Absentees {
+			if a.EmpCode == code && !a.LeaveApplied {
+				t.Errorf("%s would get mail for %s (absent without leave)", code, r.Date)
+			}
+		}
+	}
+}
+
+func TestHolidaySwap_WFHTuesday_LeaveTueAndThu_NoMail(t *testing.T) {
+	report := runHolidayWeek(t, []LeaveTransaction{
+		{ID: 1, FromDate: "2026-10-13", ToDate: "2026-10-13", Days: 1},
+		{ID: 2, FromDate: "2026-10-15", ToDate: "2026-10-15", Days: 1},
+	})
+	assertNoMail(t, report, "00001")
+	if a := findAbsentee(report, "2026-10-15", "00001"); a == nil || !a.LeaveApplied {
+		t.Error("Thursday should be reported as leave applied")
+	}
+}
+
+func TestHolidaySwap_LeaveTue_ThuNoLeave_ThuIsSwappedWFH(t *testing.T) {
+	report := runHolidayWeek(t, []LeaveTransaction{
+		{ID: 1, FromDate: "2026-10-13", ToDate: "2026-10-13", Days: 1},
+	})
+	// Tue is the default WFH day; Thu (no leave) is the swapped WFH day.
+	assertNoMail(t, report, "00001")
+}
+
+// Holiday moves the WFH day, it doesn't add one: absent Tue (default WFH)
+// and Thu with no leave → only one WFH day allowed, mail for Thu.
+func TestHolidaySwap_AbsentTueAndThuNoLeave_MailForThu(t *testing.T) {
+	report := runHolidayWeek(t, nil)
+	if a := findAbsentee(report, "2026-10-15", "00001"); a == nil || a.LeaveApplied {
+		t.Error("Thursday should be reported as absent without leave")
+	}
+	if a := findAbsentee(report, "2026-10-13", "00001"); a != nil {
+		t.Error("Tuesday is the WFH day and must not be reported")
+	}
+}
+
+// Prod shape: the holiday date has no attendance rows, so it is missing from
+// records entirely (not sent as an empty record). WFH Wed, Wed holiday,
+// absent Tue without leave → Tue is the moved WFH day, no mail.
+func TestHolidaySwap_HolidayDateMissing_WFHWed_AbsentTue_NoMail(t *testing.T) {
+	srv := httptest.NewServer(&fakeGreytHR{respond: func(empID, n int, start, end string) (int, *EmployeeLeaveData) {
+		return emptyLeave(empID)
+	}})
+	defer srv.Close()
+
+	withEmp := append([]string{"00001"}, presentCodes...)
+	records := []AttendanceRecord{
+		{Date: "2026-10-19", PresentList: withEmp},
+		{Date: "2026-10-20", PresentList: presentCodes},
+		{Date: "2026-10-22", PresentList: withEmp},
+		{Date: "2026-10-23", PresentList: withEmp},
+	}
+	event := buildEvent(t, records, empData(testEmp{"00001", 1, "Alice", "a@t.com"}))
+	vars := map[string]string{"WFH_EMP_DAYS": `{"00001":"Wednesday"}`}
+	out, err := Execute(event, map[string]string{"baseURL": srv.URL}, vars, log.New(0, "test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoMail(t, parseReport(t, out), "00001")
+}

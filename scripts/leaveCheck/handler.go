@@ -81,6 +81,29 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 	excludeSet := csvToSet(vars["EXCLUDE_EMP_CODES"])
 	wfhSet := csvToSet(vars["WFH_EMP_CODES"])
 
+	// WFH_EMP_DAYS: JSON object of empCode -> default WFH weekday, e.g. {"00123":"Tuesday","00456":"Thursday"}
+	wfhDays := map[string]string{}
+	if s := strings.TrimSpace(vars["WFH_EMP_DAYS"]); s != "" {
+		if err := json.Unmarshal([]byte(s), &wfhDays); err != nil {
+			return "", fmt.Errorf("unmarshal WFH_EMP_DAYS: %w", err)
+		}
+	}
+
+	// ponytail: one bool works because records are always a single Mon-Fri week.
+	// If a Tue/Wed/Thu is a holiday, WFH_EMP_DAYS employees may move their WFH to another day.
+	// A holiday date may come as a record with <5 present, or be missing entirely
+	// (no attendance rows that day), so look for a Tue-Thu with no working record.
+	workingDays := map[time.Weekday]bool{}
+	for _, rec := range records {
+		if len(sliceToSet(rec.PresentList)) < 5 {
+			continue
+		}
+		if d, err := time.Parse("2006-01-02", rec.Date); err == nil {
+			workingDays[d.Weekday()] = true
+		}
+	}
+	midWeekHoliday := !workingDays[time.Tuesday] || !workingDays[time.Wednesday] || !workingDays[time.Thursday]
+
 	empCodeToName := inputEvent.Employees.EmpCodeToName
 	empCodeToEmail := inputEvent.Employees.EmpCodeToEmail
 	empCodeToID := inputEvent.Employees.EmpCodeToID
@@ -105,10 +128,21 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 			continue
 		}
 
+		weekday := ""
+		if d, err := time.Parse("2006-01-02", rec.Date); err == nil {
+			weekday = d.Weekday().String()
+		}
+
 		var absentCodes []string
 		for code := range activeEmpCodes {
 			if presentSet[code] || excludeSet[code] || wfhSet[code] {
 				continue
+			}
+			if day, ok := wfhDays[code]; ok {
+				if !midWeekHoliday && strings.EqualFold(strings.TrimSpace(day), weekday) {
+					continue // default WFH day
+				}
+				// Holiday week: all absences stay in; one WFH day is picked after leave checks.
 			}
 			empID, hasID := empCodeToID[code]
 			if !hasID {
@@ -262,6 +296,40 @@ func Execute(event string, config map[string]string, vars map[string]string, log
 			}
 		}
 		needsCheck = stillNeeds
+	}
+
+	// Holiday week: the WFH day can move, but there is still only ONE.
+	// Excuse one absence WITHOUT leave per WFH_EMP_DAYS employee, preferring
+	// their default day; the rest get mail.
+	// e.g. Wed holiday, WFH Tue: Tue leave + Thu absent -> Thu excused;
+	// Tue + Thu absent, no leave -> Tue excused, Thu mailed.
+	if midWeekHoliday {
+		wfhDate := map[string]string{} // empCode -> excused date
+		for _, rep := range report {
+			weekday := ""
+			if d, err := time.Parse("2006-01-02", rep.Date); err == nil {
+				weekday = d.Weekday().String()
+			}
+			for _, a := range rep.Absentees {
+				day, ok := wfhDays[a.EmpCode]
+				if !ok || a.LeaveApplied {
+					continue
+				}
+				if _, set := wfhDate[a.EmpCode]; !set || strings.EqualFold(strings.TrimSpace(day), weekday) {
+					wfhDate[a.EmpCode] = rep.Date
+				}
+			}
+		}
+		for i := range report {
+			var kept []AbsenteeDetail
+			for _, a := range report[i].Absentees {
+				if !a.LeaveApplied && wfhDate[a.EmpCode] == report[i].Date {
+					continue
+				}
+				kept = append(kept, a)
+			}
+			report[i].Absentees = kept
+		}
 	}
 
 	// Remove employees whose deeper check failed from the report entirely.
